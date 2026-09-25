@@ -75,12 +75,28 @@ def sheets_client():
 
 
 def find_header_row(values):
-    """'일' 로 시작하고 '예산' 을 포함하는 행을 헤더 행으로 판단한다.
-    이 시트는 상단에 제목/안내문이 여러 줄 있어서 고정 행 번호를 쓰면 깨지기 쉽다."""
+    """'일' 셀이 있고 '예산' 을 포함하는 행을 헤더 행으로 판단한다.
+    이 시트는 상단에 제목/안내문이 여러 줄 있어서 고정 행 번호를 쓰면 깨지기 쉽다.
+    A열은 빈 스페이서 열이라 '일' 은 row[0]이 아니라 다른 열에 있으므로,
+    헤더 행 인덱스와 함께 '일' 이 있는 열 인덱스(label_col)도 함께 반환한다."""
     for i, row in enumerate(values):
-        if row and row[0].strip() == "일" and any("예산" in c for c in row):
-            return i
+        if any("예산" in c for c in row):
+            for j, cell in enumerate(row):
+                if cell.strip() == "일":
+                    return i, j
     raise RuntimeError("헤더 행을 못 찾았습니다 — 시트 상단 구조가 바뀐 것 같습니다.")
+
+
+def section_bounds(header, label_col):
+    """이 시트는 'Total' 요약 섹션 뒤로 매체별 섹션이 같은 헤더 문구로 반복된다.
+    빈 칸이 섹션 경계이므로, label_col 다음의 첫 빈 칸까지만 잘라서
+    dict(zip(...))에서 중복 헤더 키가 뒤 섹션 값으로 덮어써지는 걸 막는다."""
+    end = len(header)
+    for j in range(label_col + 1, len(header)):
+        if header[j].strip() == "":
+            end = j
+            break
+    return label_col, end
 
 
 def parse_number(cell: str):
@@ -115,8 +131,10 @@ def fetch_rows(service, target_date: datetime.date):
         .execute()
     )
     values = resp.get("values", [])
-    header_idx = find_header_row(values)
+    header_idx, label_col = find_header_row(values)
     header = values[header_idx]
+    start, end = section_bounds(header, label_col)
+    section_header = [h.strip() for h in header[start:end]]
 
     wanted = {
         "today": row_date_label(target_date),
@@ -126,14 +144,14 @@ def fetch_rows(service, target_date: datetime.date):
 
     found = {}
     for row in values[header_idx + 1 :]:
-        if not row:
+        if len(row) <= label_col:
             continue
-        label = row[0].strip()
+        label = row[label_col].strip()
         for key, date_label in wanted.items():
             if label == date_label and key not in found:
                 # 셀 개수가 헤더보다 짧을 수 있으니 채워서 zip
                 padded = row + [""] * (len(header) - len(row))
-                found[key] = dict(zip(header, padded))
+                found[key] = dict(zip(section_header, padded[start:end]))
 
     missing = [k for k in wanted if k not in found]
     if missing:
