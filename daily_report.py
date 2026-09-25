@@ -168,36 +168,117 @@ def pct_change(new, old):
     return round((new - old) / old, 4)
 
 
-def build_notion_properties(target_date, today, prev_day, prev_week):
+def compute_metrics(today, prev_day, prev_week):
+    """오늘/전일/전주 동요일 세 행에서 리포트에 쓰이는 원시 수치를 한 번만 뽑아둔다."""
+
     def g(row, sheet_col):
         return parse_number(row.get(sheet_col))
 
-    설치_today = g(today, "앱설치 (Total)")
-    가입_today = g(today, "회원가입 (Total)")
-    설치_prev = g(prev_day, "앱설치 (Total)")
-    가입_prev = g(prev_day, "회원가입 (Total)")
-    설치_pw = g(prev_week, "앱설치 (Total)")
-    가입_pw = g(prev_week, "회원가입 (Total)")
+    return {
+        "집행_금액": g(today, "집행 금액"),
+        "예산_소진율": g(today, "예산 소진율"),
+        "설치_today": g(today, "앱설치 (Total)"),
+        "설치_prev": g(prev_day, "앱설치 (Total)"),
+        "설치_pw": g(prev_week, "앱설치 (Total)"),
+        "가입_today": g(today, "회원가입 (Total)"),
+        "가입_prev": g(prev_day, "회원가입 (Total)"),
+        "가입_pw": g(prev_week, "회원가입 (Total)"),
+        "cpi": g(today, "설치당 단가 (Total)"),
+        "cpa": g(today, "회원가입당 단가 (Total)"),
+        "가입전환율": g(today, "가입 전환율 (Total)"),
+    }
 
-    props = {
+
+def build_notion_properties(target_date, m):
+    return {
         "날짜": {"title": [{"text": {"content": target_date.isoformat()}}]},
         "요일": {"select": {"name": WEEKDAY_KR[target_date.weekday()]}},
-        "집행 금액(원)": {"number": g(today, "집행 금액")},
-        "예산 소진율(%)": {"number": g(today, "예산 소진율")},
-        "앱설치": {"number": 설치_today},
-        "회원가입": {"number": 가입_today},
-        "CPI(원)": {"number": g(today, "설치당 단가 (Total)")},
-        "CPA(원)": {"number": g(today, "회원가입당 단가 (Total)")},
-        "가입전환율(%)": {"number": g(today, "가입 전환율 (Total)")},
-        "전일 대비 설치 증감(%)": {"number": pct_change(설치_today, 설치_prev)},
-        "전일 대비 가입 증감(%)": {"number": pct_change(가입_today, 가입_prev)},
-        "전주 동요일 대비 설치 증감(%)": {"number": pct_change(설치_today, 설치_pw)},
-        "전주 동요일 대비 가입 증감(%)": {"number": pct_change(가입_today, 가입_pw)},
+        "집행 금액(원)": {"number": m["집행_금액"]},
+        "예산 소진율(%)": {"number": m["예산_소진율"]},
+        "앱설치": {"number": m["설치_today"]},
+        "회원가입": {"number": m["가입_today"]},
+        "CPI(원)": {"number": m["cpi"]},
+        "CPA(원)": {"number": m["cpa"]},
+        "가입전환율(%)": {"number": m["가입전환율"]},
+        "전일 대비 설치 증감(%)": {"number": pct_change(m["설치_today"], m["설치_prev"])},
+        "전일 대비 가입 증감(%)": {"number": pct_change(m["가입_today"], m["가입_prev"])},
+        "전주 동요일 대비 설치 증감(%)": {"number": pct_change(m["설치_today"], m["설치_pw"])},
+        "전주 동요일 대비 가입 증감(%)": {"number": pct_change(m["가입_today"], m["가입_pw"])},
     }
-    return props
 
 
-def create_notion_page(properties):
+def format_num(value, unit=""):
+    if value is None:
+        return "N/A"
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return f"{value:,}{unit}"
+
+
+def format_ratio_pct(value):
+    """0.641 같은 비율값을 '64.1%'로 표시 (증감이 아닌 절대 수치용)."""
+    return "N/A" if value is None else f"{value * 100:.1f}%"
+
+
+def format_change_pct(value):
+    """pct_change() 결과를 부호가 붙은 '+20.6%' 형태로 표시."""
+    return "N/A" if value is None else f"{value * 100:+.1f}%"
+
+
+def build_summary_blocks(target_date, m):
+    """숫자 속성과 별개로, 페이지 본문에 들어갈 서술형 요약 블록을 만든다."""
+
+    def paragraph(text):
+        return {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+        }
+
+    def bullet(text):
+        return {
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+        }
+
+    설치_전일비 = pct_change(m["설치_today"], m["설치_prev"])
+    설치_전주비 = pct_change(m["설치_today"], m["설치_pw"])
+    가입_전일비 = pct_change(m["가입_today"], m["가입_prev"])
+    가입_전주비 = pct_change(m["가입_today"], m["가입_pw"])
+
+    weekday = WEEKDAY_KR[target_date.weekday()]
+    summary = (
+        f"{target_date.isoformat()} ({weekday}) 집행 금액 {format_num(m['집행_금액'], '원')}"
+        f"(예산 소진율 {format_ratio_pct(m['예산_소진율'])}), "
+        f"앱설치 {format_num(m['설치_today'])}건(전일 대비 {format_change_pct(설치_전일비)}, "
+        f"전주 동요일 대비 {format_change_pct(설치_전주비)}), "
+        f"회원가입 {format_num(m['가입_today'])}건(전일 대비 {format_change_pct(가입_전일비)}, "
+        f"전주 동요일 대비 {format_change_pct(가입_전주비)})을 기록했습니다."
+    )
+
+    return [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "📊 요약"}}]},
+        },
+        paragraph(summary),
+        bullet(f"집행 금액: {format_num(m['집행_금액'], '원')} (예산 소진율 {format_ratio_pct(m['예산_소진율'])})"),
+        bullet(
+            f"앱설치: {format_num(m['설치_today'])}건 "
+            f"(전일 대비 {format_change_pct(설치_전일비)}, 전주 동요일 대비 {format_change_pct(설치_전주비)})"
+        ),
+        bullet(
+            f"회원가입: {format_num(m['가입_today'])}건 "
+            f"(전일 대비 {format_change_pct(가입_전일비)}, 전주 동요일 대비 {format_change_pct(가입_전주비)})"
+        ),
+        bullet(f"CPI: {format_num(m['cpi'], '원')}    CPA: {format_num(m['cpa'], '원')}"),
+        bullet(f"가입 전환율: {format_ratio_pct(m['가입전환율'])}"),
+    ]
+
+
+def create_notion_page(properties, children=None):
     headers = {
         "Authorization": f"Bearer {os.environ['NOTION_TOKEN']}",
         "Notion-Version": NOTION_VERSION,
@@ -207,6 +288,8 @@ def create_notion_page(properties):
         "parent": {"database_id": DAILY_DB_ID},
         "properties": properties,
     }
+    if children:
+        payload["children"] = children
     resp = requests.post(f"{NOTION_API}/pages", headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -234,10 +317,10 @@ def main():
     service = sheets_client()
     rows = fetch_rows(service, target_date)
 
-    properties = build_notion_properties(
-        target_date, rows["today"], rows["prev_day"], rows["prev_week_same_weekday"]
-    )
-    page = create_notion_page(properties)
+    metrics = compute_metrics(rows["today"], rows["prev_day"], rows["prev_week_same_weekday"])
+    properties = build_notion_properties(target_date, metrics)
+    children = build_summary_blocks(target_date, metrics)
+    page = create_notion_page(properties, children=children)
     page_url = page.get("url", "")
     print(f"노션 페이지 생성 완료: {page_url}")
 
