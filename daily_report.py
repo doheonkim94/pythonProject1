@@ -48,7 +48,7 @@ SHEET_TAB = "일별 Summary - Total"
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
-DAILY_DB_ID = "17ff48f0-3fd9-4ab0-9c7c-5d64bda5aa5d"  # 일간 리포트 데이터 소스 ID
+DAILY_DB_ID = "3e6fbc1a-b2c3-8102-8e86-c4fae95fe55b"  # 일간 리포트 데이터베이스 ID
 
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
@@ -204,7 +204,7 @@ def create_notion_page(properties):
         "Content-Type": "application/json",
     }
     payload = {
-        "parent": {"data_source_id": DAILY_DB_ID},
+        "parent": {"database_id": DAILY_DB_ID},
         "properties": properties,
     }
     resp = requests.post(f"{NOTION_API}/pages", headers=headers, json=payload, timeout=30)
