@@ -338,10 +338,13 @@ def fetch_mtd_series(service, target_date):
     return series
 
 
-def fetch_meta_signup_age(target_date):
+GENDER_LABEL_KR = {"female": "여성", "male": "남성", "unknown": "성별 미확인"}
+
+
+def fetch_meta_signup_age_gender(target_date):
     """META 광고 계정에서 이번 달(1일~target_date) 회원가입(앱 SDK
-    complete_registration 이벤트) 건수를 연령대별로 집계한다. 다른 매체는
-    연령 데이터를 아예 안 줘서, 이건 META 전용 지표로만 취급해야 한다."""
+    complete_registration 이벤트) 건수를 연령대 x 성별로 집계한다. 다른
+    매체는 연령 데이터를 아예 안 줘서, 이건 META 전용 지표로만 취급해야 한다."""
     token = os.environ["META_ACCESS_TOKEN"]
     month_start = target_date.replace(day=1)
     params = {
@@ -357,28 +360,30 @@ def fetch_meta_signup_age(target_date):
     resp.raise_for_status()
     rows = resp.json().get("data", [])
 
-    by_age = {age: 0 for age in AGE_BUCKET_ORDER}
+    by_age_gender = {age: {"female": 0, "male": 0, "unknown": 0} for age in AGE_BUCKET_ORDER}
     for row in rows:
         age = row.get("age")
-        if age not in by_age:
+        gender = row.get("gender")
+        if age not in by_age_gender or gender not in ("female", "male", "unknown"):
             continue
         for action in row.get("actions", []):
             if action["action_type"] == "app_custom_event.fb_mobile_complete_registration":
-                by_age[age] += int(float(action["value"]))
+                by_age_gender[age][gender] += int(float(action["value"]))
                 break
-    return by_age
+    return by_age_gender
 
 
-def fetch_airbridge_channel_actuals(target_date, timeout_sec=20):
-    """Airbridge(MMP)에서 그날의 채널별 실제 설치·가입 수를 가져온다. 시트의
-    MediaMix 탭은 예산 '계획'만 있고 실적이 없어서, UAC·네이버BSA처럼 소재
-    단위 추적이 없는 매체도 이걸로 실제 성과를 보여줄 수 있다.
-    쿼리는 비동기라 taskId를 받고 SUCCESS 될 때까지 잠깐 polling한다."""
+def fetch_airbridge_channel_actuals(date_from, date_to, timeout_sec=20):
+    """Airbridge(MMP)에서 date_from~date_to 기간의 채널별 실제 설치·가입 수를
+    가져온다. 시트의 MediaMix 탭은 예산 '계획'만 있고 실적이 없어서,
+    UAC·네이버BSA처럼 소재 단위 추적이 없는 매체도 이걸로 실제 성과를
+    보여줄 수 있다. 쿼리는 비동기라 taskId를 받고 SUCCESS 될 때까지 잠깐
+    polling한다."""
     token = os.environ["AIRBRIDGE_API_TOKEN"]
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     body = {
-        "from": target_date.isoformat(),
-        "to": target_date.isoformat(),
+        "from": date_from.isoformat(),
+        "to": date_to.isoformat(),
         "groupBys": ["channel"],
         "metrics": ["app_installs", "app_sign_up"],
     }
@@ -790,7 +795,7 @@ def find_media(mediamix, keyword):
 
 def build_children(
     target_date, daily, mediamix, high, low, media_creatives, mtd,
-    mtd_chart_id=None, age_chart_id=None, airbridge_actuals=None,
+    mtd_chart_id=None, age_chart_id=None, airbridge_actuals=None, media_chart_id=None,
 ):
     def g(row, col):
         return parse_number(row.get(col))
@@ -823,8 +828,11 @@ def build_children(
     if mtd_chart_id:
         children.append(image_upload_block(mtd_chart_id, "이번 달 일별 앱설치 · 회원가입 추이"))
     if age_chart_id:
-        children.append(para("👥 META 광고 전환(회원가입) 기준 연령대 분포 — 연령 데이터는 현재 META만 제공합니다."))
-        children.append(image_upload_block(age_chart_id, "META 가입자 연령대 분포 (이번 달 누적)"))
+        children.append(para("👥 META 광고 전환(회원가입) 기준 연령대·성별 분포 — 연령 데이터는 현재 META만 제공합니다."))
+        children.append(image_upload_block(age_chart_id, "META 가입자 연령대·성별 분포 (이번 달 누적)"))
+    if media_chart_id:
+        children.append(para("📡 매체별 실제 설치 수 (Airbridge 기준, 이번 달 누적) — UAC·네이버BSA 포함 전체 매체."))
+        children.append(image_upload_block(media_chart_id, "이번 달 매체별 실제 설치 수"))
 
     children.append(h2(f"1. 💰 전체 예산 / 집행 금액 / 소진율 — {date_label}"))
     children.append(
@@ -857,41 +865,37 @@ def build_children(
 
     children.append(h2("3. 📡 매체별 효율"))
     if mediamix:
-        children.append(para(f"{target_date.month}월 매체별 예산 배분(계획). 매체별 실적은 원본 시트에 없어 계획 대비 비교는 별도 연동이 필요합니다."))
-        children.append(
-            table(
-                ["매체", "예산", "비중", "예상 CPI", "예상 CPA"],
+        note = f"{target_date.month}월 매체별 예산 배분(계획) vs {date_label} 실제 성과(Airbridge 기준)."
+        if not airbridge_actuals:
+            note += " (Airbridge 연동 안 됨 — 실제 성과 칸은 비어 있습니다)"
+        children.append(para(note))
+
+        def match_actual(media_label):
+            for key, v in (airbridge_actuals or {}).items():
+                if key in media_label:
+                    return v
+            return None
+
+        rows = []
+        for r in mediamix:
+            actual = match_actual(r["매체"])
+            rows.append(
                 [
-                    [
-                        r["매체"],
-                        fmt_num(r["예산"], "원"),
-                        fmt_ratio_pct(r["비중"]),
-                        fmt_num(r["CPI"], "원"),
-                        fmt_num(r["CPA"], "원"),
-                    ]
-                    for r in mediamix
-                ],
+                    r["매체"],
+                    fmt_num(r["예산"], "원"),
+                    fmt_ratio_pct(r["비중"]),
+                    fmt_num(r["CPI"], "원"),
+                    fmt_num(r["CPA"], "원"),
+                    fmt_num(actual["install"]) if actual else "-",
+                    fmt_num(actual["signup"]) if actual else "-",
+                    fmt_ratio_pct(actual["signup"] / actual["install"]) if actual and actual["install"] else "-",
+                ]
             )
+        children.append(
+            table(["매체", "예산(계획)", "비중", "예상 CPI", "예상 CPA", "실제 설치", "실제 가입", "실제 가입전환율"], rows)
         )
     else:
         children.append(para("이번 달 MediaMix 탭을 찾지 못했습니다 — 탭 이름 규칙이 바뀌었을 수 있습니다."))
-
-    if airbridge_actuals:
-        children.append(para(f"📊 실제 성과 (Airbridge 기준) — {date_label}. 매체별 실제 설치·가입 수입니다."))
-        children.append(
-            table(
-                ["매체", "설치", "가입", "가입전환율"],
-                [
-                    [
-                        label,
-                        fmt_num(v["install"]),
-                        fmt_num(v["signup"]),
-                        fmt_ratio_pct(v["signup"] / v["install"]) if v["install"] else "-",
-                    ]
-                    for label, v in airbridge_actuals.items()
-                ],
-            )
-        )
 
     children.append(h2(f"4. 🎨 전체 소재 효율 — {date_label}"))
     children.append(para(f"{date_label} 기준 운영 중인 소재 (D+14 집계 기준 수치)."))
@@ -1117,13 +1121,16 @@ def generate_report(sheets, drive, target_date):
 
     age_chart_id = None
     try:
-        by_age = fetch_meta_signup_age(target_date)
-        if any(by_age.values()):
+        by_age_gender = fetch_meta_signup_age_gender(target_date)
+        if any(any(g.values()) for g in by_age_gender.values()):
             chart_path = f"/tmp/meta_age_chart_{target_date.isoformat()}.png"
-            charts.bar_chart(
-                list(by_age.keys()),
-                list(by_age.values()),
-                f"META 가입자 연령대 분포 (이번 달 누적, {target_date.year}-{target_date.month:02d})",
+            charts.stacked_bar_chart(
+                AGE_BUCKET_ORDER,
+                {
+                    GENDER_LABEL_KR[gender]: [by_age_gender[age][gender] for age in AGE_BUCKET_ORDER]
+                    for gender in ("female", "male", "unknown")
+                },
+                f"META 가입자 연령대·성별 분포 (이번 달 누적, {target_date.year}-{target_date.month:02d})",
                 chart_path,
                 ylabel="회원가입 수",
             )
@@ -1132,10 +1139,32 @@ def generate_report(sheets, drive, target_date):
         print(f"[경고] META 연령대 차트 생성/업로드 실패 ({exc}) — 차트 없이 진행합니다.")
 
     try:
-        airbridge_actuals = fetch_airbridge_channel_actuals(target_date)
+        airbridge_actuals = fetch_airbridge_channel_actuals(target_date, target_date)
     except Exception as exc:  # noqa: BLE001
         print(f"[경고] Airbridge 채널별 실적 조회 실패 ({exc}) — 이 표는 비워둡니다.")
         airbridge_actuals = None
+
+    media_chart_id = None
+    try:
+        month_start = target_date.replace(day=1)
+        mtd_actuals = (
+            airbridge_actuals
+            if month_start == target_date
+            else fetch_airbridge_channel_actuals(month_start, target_date)
+        )
+        if mtd_actuals:
+            sorted_items = sorted(mtd_actuals.items(), key=lambda kv: kv[1]["install"] or 0, reverse=True)
+            chart_path = f"/tmp/media_install_chart_{target_date.isoformat()}.png"
+            charts.bar_chart(
+                [label for label, _ in sorted_items],
+                [v["install"] or 0 for _, v in sorted_items],
+                f"매체별 실제 설치 수 (이번 달 누적, {target_date.year}-{target_date.month:02d})",
+                chart_path,
+                ylabel="설치 수",
+            )
+            media_chart_id = notion_upload_file(chart_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[경고] 매체별 설치 차트 생성/업로드 실패 ({exc}) — 차트 없이 진행합니다.")
 
     mediamix = aggregate_mediamix(fetch_mediamix(sheets, target_date))
     active = fetch_active_creatives(sheets, target_date)
@@ -1165,7 +1194,7 @@ def generate_report(sheets, drive, target_date):
     properties = build_properties(target_date, daily)
     children = build_children(
         target_date, daily, mediamix, high, low, media_creatives, mtd,
-        mtd_chart_id, age_chart_id, airbridge_actuals,
+        mtd_chart_id, age_chart_id, airbridge_actuals, media_chart_id,
     )
 
     page = create_notion_page(properties, children)

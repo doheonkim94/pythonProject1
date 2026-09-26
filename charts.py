@@ -76,6 +76,35 @@ def line_chart(dates, series, title, out_path, ylabel=""):
     return out_path
 
 
+def stacked_bar_chart(labels, series, title, out_path, ylabel=""):
+    """series: {"label": [values...]} — 카테고리별로 쌓아 그린다(성별 등).
+    2개 이상이라 항상 범례 표시, 세그먼트 사이에 서페이스색 테두리로 얇은 gap을 낸다."""
+    fig, ax = plt.subplots(figsize=(7, 3), dpi=150)
+    _base_style(ax, fig)
+    ax.xaxis.grid(False)
+
+    colors = [SERIES_BLUE, SERIES_ORANGE, SERIES_AQUA]
+    bottom = [0] * len(labels)
+    for i, (label, values) in enumerate(series.items()):
+        ax.bar(
+            labels, values, bottom=bottom, label=label,
+            color=colors[i % len(colors)], width=0.6,
+            edgecolor=SURFACE, linewidth=1.5,
+        )
+        bottom = [b + v for b, v in zip(bottom, values)]
+
+    ax.set_title(title, color=TEXT_PRIMARY, fontsize=12, fontweight="bold", loc="left", pad=12)
+    if ylabel:
+        ax.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=9)
+    ax.tick_params(axis="x", colors=TEXT_PRIMARY, labelsize=9)
+    ax.legend(loc="upper left", frameon=False, fontsize=9, labelcolor=TEXT_SECONDARY)
+
+    fig.tight_layout()
+    fig.savefig(out_path, facecolor=SURFACE)
+    plt.close(fig)
+    return out_path
+
+
 def bar_chart(labels, values, title, out_path, ylabel="", color=SERIES_BLUE):
     fig, ax = plt.subplots(figsize=(7, 3), dpi=150)
     _base_style(ax, fig)
