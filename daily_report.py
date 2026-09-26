@@ -114,16 +114,21 @@ COLUMN_MAP = {
 }
 
 
-def fetch_daily_rows(service, target_date):
+def fetch_daily_tab_values(service):
     resp = (
         service.spreadsheets()
         .values()
         .get(spreadsheetId=SHEET_ID, range=f"'{DAILY_TAB}'!A1:BN2000")
         .execute()
     )
-    values = resp.get("values", [])
+    return resp.get("values", [])
 
-    # A열은 빈 스페이서 열이라 '일' 은 row[0]이 아니라 다른 열에 있다.
+
+def locate_daily_header(values):
+    """'일별 Summary - Total' 탭의 헤더 행 인덱스, '일' 레이블 열, 그 구간의
+    헤더 목록을 찾는다. A열은 빈 스페이서 열이라 '일' 은 row[0]이 아니라 다른
+    열에 있고, 'Total' 요약 섹션 뒤로 매체별 섹션이 같은 헤더 문구로
+    반복되므로 label_col 다음의 첫 빈 칸까지만 잘라서 중복 헤더를 피한다."""
     header_idx, label_col = None, None
     for i, row in enumerate(values):
         if any("예산" in c for c in row):
@@ -137,15 +142,19 @@ def fetch_daily_rows(service, target_date):
         raise RuntimeError("일별 Summary 헤더 행을 못 찾았습니다.")
     header = values[header_idx]
 
-    # 'Total' 요약 섹션 뒤로 매체별 섹션이 같은 헤더 문구로 반복되므로,
-    # label_col 다음의 첫 빈 칸까지만 잘라서 dict(zip(...))에서 중복 헤더가
-    # 뒤 섹션 값으로 덮어써지는 걸 막는다.
     section_end = len(header)
     for j in range(label_col + 1, len(header)):
         if header[j].strip() == "":
             section_end = j
             break
     section_header = [h.strip() for h in header[label_col:section_end]]
+    return header_idx, label_col, section_end, section_header
+
+
+def fetch_daily_rows(service, target_date):
+    values = fetch_daily_tab_values(service)
+    header_idx, label_col, section_end, section_header = locate_daily_header(values)
+    header = values[header_idx]
 
     wanted = {
         "today": row_date_label(target_date),
@@ -165,6 +174,52 @@ def fetch_daily_rows(service, target_date):
     if missing:
         raise RuntimeError(f"일별 Summary에서 다음 날짜 행을 못 찾았습니다: {missing}")
     return found
+
+
+def fetch_mtd_summary(service, target_date):
+    """이번 달 1일부터 target_date까지의 일별 행을 모두 모아 누적 지표를
+    직접 계산한다. 시트에 있는 월별 합계 행은 시트 자체의 '오늘' 셀을 기준으로
+    계산돼 있어서, 과거 날짜로 백필 테스트하면 그 날짜가 아니라 실제 오늘까지
+    누적된 값이 나올 수 있다 — 그래서 매번 일별 행을 직접 합산한다."""
+    values = fetch_daily_tab_values(service)
+    header_idx, label_col, section_end, section_header = locate_daily_header(values)
+    header = values[header_idx]
+    month_start = target_date.replace(day=1)
+
+    def g(row, col):
+        return parse_number(row.get(col))
+
+    total_spend = total_install = total_signup = 0
+    days_counted = 0
+    for row in values[header_idx + 1 :]:
+        if len(row) <= label_col:
+            continue
+        m = re.match(r"^(\d{1,2})/(\d{1,2}) \(", row[label_col].strip())
+        if not m:
+            continue
+        month, day = int(m.group(1)), int(m.group(2))
+        try:
+            d = datetime.date(target_date.year, month, day)
+        except ValueError:
+            continue
+        if not (month_start <= d <= target_date):
+            continue
+        padded = row + [""] * (len(header) - len(row))
+        r = dict(zip(section_header, padded[label_col:section_end]))
+        total_spend += g(r, "집행 금액") or 0
+        total_install += g(r, "앱설치 (Total)") or 0
+        total_signup += g(r, "회원가입 (Total)") or 0
+        days_counted += 1
+
+    return {
+        "days": days_counted,
+        "spend": total_spend,
+        "install": total_install,
+        "signup": total_signup,
+        "cpi": round(total_spend / total_install) if total_install else None,
+        "cpa": round(total_spend / total_signup) if total_signup else None,
+        "cvr": round(total_signup / total_install, 4) if total_install else None,
+    }
 
 
 # ── 2. MediaMix_YY.MM. (매체별 예산 배분) ───────────────────────────────
@@ -486,11 +541,33 @@ def table(headers, rows, link_col=None):
     }
 
 
-def build_children(target_date, daily, mediamix, high, low, media_creatives):
+def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd):
     def g(row, col):
         return parse_number(row.get(col))
 
-    children = [h2("1. 전체 예산 / 집행 금액 / 소진율")]
+    children = [h2(f"📅 이번 달 누적 요약 ({target_date.year}-{target_date.month:02d}-01 ~ {target_date.isoformat()}, {mtd['days']}일)")]
+    month_budget = sum(r["예산"] or 0 for r in mediamix) or None
+    exhaustion = f"{mtd['spend'] / month_budget * 100:.1f}%" if month_budget else "-"
+    children.append(
+        para(
+            f"집행 {mtd['spend']:,}원"
+            + (f" / 이번 달 예산 {month_budget:,}원 대비 {exhaustion} 소진" if month_budget else "")
+        )
+    )
+    children.append(
+        table(
+            ["지표", "누적"],
+            [
+                ["앱설치", f"{mtd['install']:,}"],
+                ["회원가입", f"{mtd['signup']:,}"],
+                ["CPI", f"{mtd['cpi']:,}원" if mtd["cpi"] else "-"],
+                ["CPA", f"{mtd['cpa']:,}원" if mtd["cpa"] else "-"],
+                ["가입전환율", f"{mtd['cvr'] * 100:.1f}%" if mtd["cvr"] else "-"],
+            ],
+        )
+    )
+
+    children.append(h2("1. 전체 예산 / 집행 금액 / 소진율"))
     children.append(
         para(f"{target_date.isoformat()} 집행 {g(daily['today'], '집행 금액') or '-'}원 / "
              f"예산 소진율 {g(daily['today'], '예산 소진율') or '-'}")
@@ -662,6 +739,7 @@ def main():
     drive = drive_client(creds)
 
     daily = fetch_daily_rows(sheets, target_date)
+    mtd = fetch_mtd_summary(sheets, target_date)
     mediamix = aggregate_mediamix(fetch_mediamix(sheets, target_date))
     active = fetch_active_creatives(sheets, target_date)
     drive_ok = True
@@ -684,7 +762,7 @@ def main():
         media_creatives = {}
 
     properties = build_properties(target_date, daily)
-    children = build_children(target_date, daily, mediamix, high, low, media_creatives)
+    children = build_children(target_date, daily, mediamix, high, low, media_creatives, mtd)
 
     page = create_notion_page(properties, children)
     page_url = page.get("url", "")
