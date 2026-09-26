@@ -40,6 +40,8 @@ import time
 import holidays
 import requests
 from google.oauth2 import service_account
+
+import charts
 from googleapiclient.discovery import build
 
 SHEET_ID = "1iCeRn5-bPPFR47RydluurDcCBrKlYlMxwW02q5Bb9rA"
@@ -277,6 +279,45 @@ def fetch_mtd_summary(service, target_date):
         "cpa": round(total_spend / total_signup) if total_signup else None,
         "cvr": round(total_signup / total_install, 4) if total_install else None,
     }
+
+
+def fetch_mtd_series(service, target_date):
+    """fetch_mtd_summary와 같은 파싱을 쓰지만, 합계 대신 날짜별 값을 그대로
+    리스트로 돌려준다 — 그래프 그릴 때 쓴다."""
+    values = fetch_daily_tab_values(service)
+    header_idx, label_col, section_end, section_header = locate_daily_header(values)
+    header = values[header_idx]
+    month_start = target_date.replace(day=1)
+
+    def g(row, col):
+        return parse_number(row.get(col))
+
+    series = []
+    for row in values[header_idx + 1 :]:
+        if len(row) <= label_col:
+            continue
+        m = re.match(r"^(\d{1,2})/(\d{1,2}) \(", row[label_col].strip())
+        if not m:
+            continue
+        month, day = int(m.group(1)), int(m.group(2))
+        try:
+            d = datetime.date(target_date.year, month, day)
+        except ValueError:
+            continue
+        if not (month_start <= d <= target_date):
+            continue
+        padded = row + [""] * (len(header) - len(row))
+        r = dict(zip(section_header, padded[label_col:section_end]))
+        series.append(
+            {
+                "date": d,
+                "install": g(r, "앱설치 (Total)"),
+                "signup": g(r, "회원가입 (Total)"),
+                "spend": g(r, "집행 금액"),
+            }
+        )
+    series.sort(key=lambda x: x["date"])
+    return series
 
 
 # ── 2. MediaMix_YY.MM. (매체별 예산 배분) ───────────────────────────────
@@ -648,7 +689,7 @@ def find_media(mediamix, keyword):
     return None
 
 
-def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd):
+def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id=None):
     def g(row, col):
         return parse_number(row.get(col))
 
@@ -677,6 +718,8 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
             ],
         )
     )
+    if mtd_chart_id:
+        children.append(image_upload_block(mtd_chart_id, "이번 달 일별 앱설치 · 회원가입 추이"))
 
     children.append(h2(f"1. 💰 전체 예산 / 집행 금액 / 소진율 — {date_label}"))
     children.append(
@@ -843,6 +886,38 @@ def build_properties(target_date, daily):
     }
 
 
+def notion_upload_file(path, content_type="image/png"):
+    """노션의 파일 직접 업로드 API로 로컬 파일(차트 PNG 등)을 올리고
+    file_upload id를 돌려준다. 이 id를 image 블록에서 참조하면 된다."""
+    headers = {
+        "Authorization": f"Bearer {os.environ['NOTION_TOKEN']}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    resp = requests.post(f"{NOTION_API}/file_uploads", headers=headers, json={}, timeout=15)
+    resp.raise_for_status()
+    upload = resp.json()
+
+    with open(path, "rb") as f:
+        send_headers = {
+            "Authorization": f"Bearer {os.environ['NOTION_TOKEN']}",
+            "Notion-Version": NOTION_VERSION,
+        }
+        r2 = requests.post(
+            upload["upload_url"], headers=send_headers,
+            files={"file": (os.path.basename(path), f, content_type)}, timeout=60,
+        )
+    r2.raise_for_status()
+    return upload["id"]
+
+
+def image_upload_block(file_upload_id, caption=""):
+    block = {"object": "block", "type": "image", "image": {"type": "file_upload", "file_upload": {"id": file_upload_id}}}
+    if caption:
+        block["image"]["caption"] = [{"type": "text", "text": {"content": caption}}]
+    return block
+
+
 def fetch_published_dates():
     """일간 리포트 DB에 이미 만들어진 페이지들의 '날짜' 제목을 모두 모은다.
     자동 모드에서 이미 발행된 날짜를 다시 만들지 않기 위해 쓴다."""
@@ -902,6 +977,22 @@ def notify_gchat(page_url, target_date):
 def generate_report(sheets, drive, target_date):
     daily = fetch_daily_rows(sheets, target_date)
     mtd = fetch_mtd_summary(sheets, target_date)
+
+    mtd_chart_id = None
+    try:
+        series = fetch_mtd_series(sheets, target_date)
+        if series:
+            chart_path = f"/tmp/mtd_chart_{target_date.isoformat()}.png"
+            charts.line_chart(
+                [s["date"] for s in series],
+                {"앱설치": [s["install"] or 0 for s in series], "회원가입": [s["signup"] or 0 for s in series]},
+                f"{target_date.year}-{target_date.month:02d} 일별 앱설치 · 회원가입 추이",
+                chart_path,
+            )
+            mtd_chart_id = notion_upload_file(chart_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[경고] MTD 차트 생성/업로드 실패 ({exc}) — 차트 없이 진행합니다.")
+
     mediamix = aggregate_mediamix(fetch_mediamix(sheets, target_date))
     active = fetch_active_creatives(sheets, target_date)
     drive_ok = True
@@ -928,7 +1019,7 @@ def generate_report(sheets, drive, target_date):
         media_creatives = {}
 
     properties = build_properties(target_date, daily)
-    children = build_children(target_date, daily, mediamix, high, low, media_creatives, mtd)
+    children = build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id)
 
     page = create_notion_page(properties, children)
     page_url = page.get("url", "")
