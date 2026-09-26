@@ -525,12 +525,15 @@ def summarize_media_creatives(creatives):
 
 
 # ── 4. 구글 드라이브에서 소재 원본 링크 찾기 ─────────────────────────────
-def drive_link(drive, creative_name):
+def drive_file_info(drive, creative_name):
+    """소재 원본 파일의 열람 링크와 썸네일 URL을 한 번의 조회로 가져온다.
+    thumbnailLink는 인증 없이도 바로 이미지가 뜨는 URL이라(직접 테스트로 확인),
+    노션에 외부 이미지로 그대로 박아넣을 수 있다."""
     escaped = creative_name.replace("'", "\\'")
     q = f"name contains '{escaped}' and trashed = false"
     resp = drive.files().list(
         q=q,
-        fields="files(id, webViewLink)",
+        fields="files(id, webViewLink, thumbnailLink)",
         pageSize=1,
         # 소재 원본이 '내 드라이브'가 아니라 공유 드라이브(Shared Drive)에 있어서,
         # 이 옵션이 없으면 서비스 계정에 아무 파일도 안 보인다.
@@ -540,8 +543,12 @@ def drive_link(drive, creative_name):
     ).execute()
     files = resp.get("files", [])
     if not files:
-        return None
-    return files[0].get("webViewLink")
+        return {"link": None, "thumbnail": None}
+    return {"link": files[0].get("webViewLink"), "thumbnail": files[0].get("thumbnailLink")}
+
+
+def drive_link(drive, creative_name):
+    return drive_file_info(drive, creative_name)["link"]
 
 
 # ── Notion 블록 빌더 ─────────────────────────────────────────────────
@@ -566,6 +573,18 @@ def numbered(text):
         "object": "block",
         "type": "numbered_list_item",
         "numbered_list_item": {"rich_text": [{"type": "text", "text": {"content": text}}]},
+    }
+
+
+def thumb_block(name, url):
+    return {
+        "object": "block",
+        "type": "image",
+        "image": {
+            "type": "external",
+            "external": {"url": url},
+            "caption": [{"type": "text", "text": {"content": name}}],
+        },
     }
 
 
@@ -729,6 +748,9 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
                 link_col=0,
             )
         )
+        for c in high:
+            if c.get("thumbnail"):
+                children.append(thumb_block(c["name"], c["thumbnail"]))
     if low:
         children.append(para("🔴 저효율 (중단/교체 후보)"))
         children.append(
@@ -746,6 +768,9 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
                 link_col=0,
             )
         )
+        for c in low:
+            if c.get("thumbnail"):
+                children.append(thumb_block(c["name"], c["thumbnail"]))
     if not high and not low:
         children.append(para("해당 날짜에 활성 소재 데이터를 찾지 못했습니다."))
 
@@ -883,13 +908,17 @@ def generate_report(sheets, drive, target_date):
     for c in active:
         if not drive_ok:
             c["link"] = None
+            c["thumbnail"] = None
             continue
         try:
-            c["link"] = drive_link(drive, c["name"])
+            info = drive_file_info(drive, c["name"])
+            c["link"] = info["link"]
+            c["thumbnail"] = info["thumbnail"]
         except Exception as exc:  # noqa: BLE001
             print(f"[경고] 드라이브 조회 실패 ({exc}) — 소재 링크는 비워둡니다.")
             drive_ok = False
             c["link"] = None
+            c["thumbnail"] = None
     high, low = rank_creatives(active)
 
     try:

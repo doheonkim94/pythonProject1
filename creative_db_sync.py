@@ -75,7 +75,7 @@ def upsert_page(properties, page_id, today_str):
     return resp.json()
 
 
-def build_properties(media, creative, today_str, tag, link):
+def build_properties(media, creative, today_str, tag, link, thumbnail):
     cpi = round(creative["spend"] / creative["install"]) if creative.get("install") else None
     props = {
         "소재명": {"title": [{"text": {"content": creative["name"]}}]},
@@ -94,6 +94,10 @@ def build_properties(media, creative, today_str, tag, link):
     }
     if link:
         props["드라이브 링크"] = {"url": link}
+    if thumbnail:
+        # Drive의 thumbnailLink는 인증 없이도 바로 이미지가 뜨는 URL이라, 노션의
+        # "파일 및 미디어" 속성에 외부 파일로 넣으면 테이블/갤러리 뷰에 썸네일이 뜬다.
+        props["썸네일"] = {"files": [{"type": "external", "name": creative["name"], "external": {"url": thumbnail}}]}
     return props
 
 
@@ -114,13 +118,13 @@ def sync(target_date):
         for c in creatives:
             tag = "고성과" if c["name"] in high_names else "저성과" if c["name"] in low_names else "보통"
             try:
-                link = dr.drive_link(drive, c["name"])
+                info = dr.drive_file_info(drive, c["name"])
             except Exception as exc:  # noqa: BLE001
                 print(f"[경고] {c['name']} 드라이브 조회 실패 ({exc})")
-                link = None
+                info = {"link": None, "thumbnail": None}
 
             page_id = find_page_by_name(c["name"], media)
-            props = build_properties(media, c, today_str, tag, link)
+            props = build_properties(media, c, today_str, tag, info["link"], info["thumbnail"])
             upsert_page(props, page_id, today_str)
             if page_id:
                 updated += 1
