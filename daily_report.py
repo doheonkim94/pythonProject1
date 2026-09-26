@@ -66,6 +66,20 @@ META_API = "https://graph.facebook.com/v21.0"
 META_AD_ACCOUNT_ID = "act_343984491884470"  # 파스타 광고 계정
 AGE_BUCKET_ORDER = ["13-17", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
 
+AIRBRIDGE_API = "https://api.airbridge.io"
+AIRBRIDGE_APP_NAME = "pasta"
+# Airbridge의 channel 값 -> 리포트에서 쓰는 매체 표기. 시트(MediaMix)에는 매체별
+# 실적이 없어서 UAC/네이버BSA는 지금까지 "소재 단위 추적 없음"으로만 표시했는데,
+# Airbridge(MMP)는 모든 매체의 실제 설치·가입을 채널 단위로 집계해주기 때문에
+# 이걸로 그 공백을 메운다.
+AIRBRIDGE_CHANNEL_LABEL = {
+    "google.adwords": "UAC",
+    "facebook.business": "META",
+    "moloco": "Moloco",
+    "apple.searchads": "Apple Search Ads",
+    "bsa": "네이버BSA",
+}
+
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 
@@ -353,6 +367,56 @@ def fetch_meta_signup_age(target_date):
                 by_age[age] += int(float(action["value"]))
                 break
     return by_age
+
+
+def fetch_airbridge_channel_actuals(target_date, timeout_sec=20):
+    """Airbridge(MMP)에서 그날의 채널별 실제 설치·가입 수를 가져온다. 시트의
+    MediaMix 탭은 예산 '계획'만 있고 실적이 없어서, UAC·네이버BSA처럼 소재
+    단위 추적이 없는 매체도 이걸로 실제 성과를 보여줄 수 있다.
+    쿼리는 비동기라 taskId를 받고 SUCCESS 될 때까지 잠깐 polling한다."""
+    token = os.environ["AIRBRIDGE_API_TOKEN"]
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    body = {
+        "from": target_date.isoformat(),
+        "to": target_date.isoformat(),
+        "groupBys": ["channel"],
+        "metrics": ["app_installs", "app_sign_up"],
+    }
+    resp = requests.post(
+        f"{AIRBRIDGE_API}/reports/api/v7/apps/{AIRBRIDGE_APP_NAME}/actuals/query",
+        headers=headers, json=body, timeout=30,
+    )
+    resp.raise_for_status()
+    task_id = resp.json()["task"]["taskId"]
+
+    deadline = time.time() + timeout_sec
+    result_url = f"{AIRBRIDGE_API}/reports/api/v7/apps/{AIRBRIDGE_APP_NAME}/actuals/query/{task_id}"
+    while True:
+        resp = requests.get(result_url, headers=headers, params={"skip": 0, "size": 100}, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        status = payload["task"]["status"]
+        if status == "SUCCESS":
+            break
+        if status in ("FAILURE", "CANCELED"):
+            raise RuntimeError(f"Airbridge 쿼리 실패 (status={status})")
+        if time.time() > deadline:
+            raise TimeoutError("Airbridge 쿼리가 시간 내에 끝나지 않았습니다")
+        time.sleep(1.5)
+
+    by_channel = {}
+    for row in payload["actuals"]["data"]["rows"]:
+        channel = row["groupBys"][0]
+        label = AIRBRIDGE_CHANNEL_LABEL.get(channel)
+        if not label:
+            continue
+        install = row["values"].get("app_installs", {}).get("value")
+        signup = row["values"].get("app_sign_up", {}).get("value")
+        by_channel[label] = {
+            "install": int(install) if install is not None else None,
+            "signup": int(signup) if signup is not None else None,
+        }
+    return by_channel
 
 
 # ── 2. MediaMix_YY.MM. (매체별 예산 배분) ───────────────────────────────
@@ -724,7 +788,10 @@ def find_media(mediamix, keyword):
     return None
 
 
-def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id=None, age_chart_id=None):
+def build_children(
+    target_date, daily, mediamix, high, low, media_creatives, mtd,
+    mtd_chart_id=None, age_chart_id=None, airbridge_actuals=None,
+):
     def g(row, col):
         return parse_number(row.get(col))
 
@@ -808,6 +875,23 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
         )
     else:
         children.append(para("이번 달 MediaMix 탭을 찾지 못했습니다 — 탭 이름 규칙이 바뀌었을 수 있습니다."))
+
+    if airbridge_actuals:
+        children.append(para(f"📊 실제 성과 (Airbridge 기준) — {date_label}. 매체별 실제 설치·가입 수입니다."))
+        children.append(
+            table(
+                ["매체", "설치", "가입", "가입전환율"],
+                [
+                    [
+                        label,
+                        fmt_num(v["install"]),
+                        fmt_num(v["signup"]),
+                        fmt_ratio_pct(v["signup"] / v["install"]) if v["install"] else "-",
+                    ]
+                    for label, v in airbridge_actuals.items()
+                ],
+            )
+        )
 
     children.append(h2(f"4. 🎨 전체 소재 효율 — {date_label}"))
     children.append(para(f"{date_label} 기준 운영 중인 소재 (D+14 집계 기준 수치)."))
@@ -1047,6 +1131,12 @@ def generate_report(sheets, drive, target_date):
     except Exception as exc:  # noqa: BLE001
         print(f"[경고] META 연령대 차트 생성/업로드 실패 ({exc}) — 차트 없이 진행합니다.")
 
+    try:
+        airbridge_actuals = fetch_airbridge_channel_actuals(target_date)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[경고] Airbridge 채널별 실적 조회 실패 ({exc}) — 이 표는 비워둡니다.")
+        airbridge_actuals = None
+
     mediamix = aggregate_mediamix(fetch_mediamix(sheets, target_date))
     active = fetch_active_creatives(sheets, target_date)
     drive_ok = True
@@ -1073,7 +1163,10 @@ def generate_report(sheets, drive, target_date):
         media_creatives = {}
 
     properties = build_properties(target_date, daily)
-    children = build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id, age_chart_id)
+    children = build_children(
+        target_date, daily, mediamix, high, low, media_creatives, mtd,
+        mtd_chart_id, age_chart_id, airbridge_actuals,
+    )
 
     page = create_notion_page(properties, children)
     page_url = page.get("url", "")
