@@ -24,9 +24,9 @@ v2는 본문까지 동일한 6단 구성으로 생성합니다.
                                               # 발행 안 된 날짜를 전부 찾아 발행한다.
 
 자동 모드가 쓰는 업데이트 규칙 (README 참고):
-  - 월~목 데이터: 그 다음날 오후 1시(KST)
-  - 금요일 데이터: 그 다음주 월요일 오후 1시(KST)
-  - 토/일 데이터: 그 다음 월요일 오후 1시(KST) — 금/토/일이 같은 시점에 함께 올라온다.
+  - 영업일(평일이면서 대한민국 공휴일이 아닌 날) 데이터: 그 다음 영업일 오후 1시(KST)
+  - 주말·공휴일 데이터: 연휴가 끝난 다음 영업일 오후 1시(KST)에 한꺼번에 올라온다
+    (예: 금/토/일 → 월요일, 추석 연휴 3일 → 연휴 다음 영업일)
 """
 
 import argparse
@@ -37,6 +37,7 @@ import re
 import sys
 import time
 
+import holidays
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -107,20 +108,29 @@ def row_date_label(d: datetime.date) -> str:
 
 
 # ── 자동 발행: 이 날짜의 데이터가 지금(KST) 이미 올라와 있는지 판단 ──────────
+# 대한민국 공휴일(설날/추석 같은 음력 연휴 포함)도 대행사가 쉬는 날이라, 주말과
+# 똑같이 "영업일이 아닌 날"로 취급한다. holidays 라이브러리가 연도별로 계산해준다.
+KR_HOLIDAYS = holidays.KR(years=range(2020, 2036))
+
+
+def is_business_day(d: datetime.date) -> bool:
+    return d.weekday() < 5 and d not in KR_HOLIDAYS
+
+
+def next_business_day(d: datetime.date) -> datetime.date:
+    d = d + datetime.timedelta(days=1)
+    while not is_business_day(d):
+        d += datetime.timedelta(days=1)
+    return d
+
+
 def data_ready_at(d: datetime.date) -> datetime.datetime:
     """대행사가 날짜 d의 데이터를 올리는 시점(KST)을 돌려준다.
-    월~목요일 데이터는 다음날 오후 1시, 금/토/일 데이터는 모두 그 다음 월요일
-    오후 1시에 한꺼번에 올라온다."""
-    weekday = d.weekday()  # 0=월 ... 6=일
-    if weekday <= 3:  # 월,화,수,목
-        delay_days = 1
-    elif weekday == 4:  # 금
-        delay_days = 3
-    elif weekday == 5:  # 토
-        delay_days = 2
-    else:  # 일
-        delay_days = 1
-    ready_date = d + datetime.timedelta(days=delay_days)
+    영업일(평일이면서 공휴일이 아닌 날) 데이터는 그 다음 영업일 오후 1시에 올라온다.
+    주말·공휴일이 여러 날 이어져도(연휴), 그 사이에 낀 날짜들은 모두 연휴가 끝난
+    다음 영업일에 한꺼번에 올라온다 — 금/토/일이 월요일에 함께 올라오는 것과 같은
+    원리를 공휴일에도 그대로 적용한 것."""
+    ready_date = next_business_day(d)
     return datetime.datetime.combine(ready_date, datetime.time(13, 0), tzinfo=KST)
 
 
@@ -559,6 +569,30 @@ def numbered(text):
     }
 
 
+def callout(emoji, text):
+    return {
+        "object": "block",
+        "type": "callout",
+        "callout": {
+            "rich_text": [{"type": "text", "text": {"content": text}}],
+            "icon": {"type": "emoji", "emoji": emoji},
+        },
+    }
+
+
+def date_with_weekday(d: datetime.date) -> str:
+    return f"{d.isoformat()} ({WEEKDAY_KR[d.weekday()]})"
+
+
+def fmt_num(value, unit=""):
+    return "-" if value is None else f"{value:,}{unit}"
+
+
+def fmt_ratio_pct(value):
+    """0.641 같은 절대 비율을 '64.1%'로. 증감(+/-)이 아닌 값에 쓴다."""
+    return "-" if value is None else f"{value * 100:.1f}%"
+
+
 def table(headers, rows, link_col=None):
     def cell(text, url=None):
         t = {"type": "text", "text": {"content": str(text)}}
@@ -588,72 +622,85 @@ def table(headers, rows, link_col=None):
     }
 
 
+def find_media(mediamix, keyword):
+    for r in mediamix:
+        if keyword in r["매체"]:
+            return r
+    return None
+
+
 def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd):
     def g(row, col):
         return parse_number(row.get(col))
 
-    children = [h2(f"📅 이번 달 누적 요약 ({target_date.year}-{target_date.month:02d}-01 ~ {target_date.isoformat()}, {mtd['days']}일)")]
+    date_label = date_with_weekday(target_date)
+    children = [
+        callout("🗓️", f"{date_label} 파스타 일간 리포트"),
+        h2(f"📅 이번 달 누적 요약 ({target_date.year}-{target_date.month:02d}-01 ~ {target_date.isoformat()}, {mtd['days']}일)"),
+    ]
     month_budget = sum(r["예산"] or 0 for r in mediamix) or None
     exhaustion = f"{mtd['spend'] / month_budget * 100:.1f}%" if month_budget else "-"
     children.append(
         para(
-            f"집행 {mtd['spend']:,}원"
-            + (f" / 이번 달 예산 {month_budget:,}원 대비 {exhaustion} 소진" if month_budget else "")
+            f"💰 집행 {fmt_num(mtd['spend'], '원')}"
+            + (f" / 이번 달 예산 {fmt_num(month_budget, '원')} 대비 {exhaustion} 소진" if month_budget else "")
         )
     )
     children.append(
         table(
             ["지표", "누적"],
             [
-                ["앱설치", f"{mtd['install']:,}"],
-                ["회원가입", f"{mtd['signup']:,}"],
-                ["CPI", f"{mtd['cpi']:,}원" if mtd["cpi"] else "-"],
-                ["CPA", f"{mtd['cpa']:,}원" if mtd["cpa"] else "-"],
-                ["가입전환율", f"{mtd['cvr'] * 100:.1f}%" if mtd["cvr"] else "-"],
+                ["앱설치", fmt_num(mtd["install"])],
+                ["회원가입", fmt_num(mtd["signup"])],
+                ["CPI", fmt_num(mtd["cpi"], "원")],
+                ["CPA", fmt_num(mtd["cpa"], "원")],
+                ["가입전환율", fmt_ratio_pct(mtd["cvr"])],
             ],
         )
     )
 
-    children.append(h2("1. 전체 예산 / 집행 금액 / 소진율"))
+    children.append(h2(f"1. 💰 전체 예산 / 집행 금액 / 소진율 — {date_label}"))
     children.append(
-        para(f"{target_date.isoformat()} 집행 {g(daily['today'], '집행 금액') or '-'}원 / "
-             f"예산 소진율 {g(daily['today'], '예산 소진율') or '-'}")
+        para(
+            f"집행 {fmt_num(g(daily['today'], '집행 금액'), '원')} / "
+            f"예산 소진율 {fmt_ratio_pct(g(daily['today'], '예산 소진율'))}"
+        )
     )
 
-    children.append(h2("2. 전체 효율"))
+    children.append(h2(f"2. 📈 전체 효율 — {date_label}"))
     install_t = g(daily["today"], "앱설치 (Total)")
     signup_t = g(daily["today"], "회원가입 (Total)")
     install_p = g(daily["prev_day"], "앱설치 (Total)")
     signup_p = g(daily["prev_day"], "회원가입 (Total)")
     install_w = g(daily["prev_week_same_weekday"], "앱설치 (Total)")
     signup_w = g(daily["prev_week_same_weekday"], "회원가입 (Total)")
-    pct = lambda new, old: f"{round((new - old) / old * 100, 1)}%" if new is not None and old else "-"
+    pct = lambda new, old: f"{round((new - old) / old * 100, 1):+.1f}%" if new is not None and old else "-"
     children.append(
         table(
-            ["지표", target_date.isoformat(), "전일 대비", "전주 동요일 대비"],
+            ["지표", date_label, "전일 대비", "전주 동요일 대비"],
             [
-                ["앱설치", install_t, pct(install_t, install_p), pct(install_t, install_w)],
-                ["회원가입", signup_t, pct(signup_t, signup_p), pct(signup_t, signup_w)],
-                ["CPI", g(daily["today"], "설치당 단가 (Total)"), "-", "-"],
-                ["CPA", g(daily["today"], "회원가입당 단가 (Total)"), "-", "-"],
-                ["가입전환율", g(daily["today"], "가입 전환율 (Total)"), "-", "-"],
+                ["앱설치", fmt_num(install_t), pct(install_t, install_p), pct(install_t, install_w)],
+                ["회원가입", fmt_num(signup_t), pct(signup_t, signup_p), pct(signup_t, signup_w)],
+                ["CPI", fmt_num(g(daily["today"], "설치당 단가 (Total)"), "원"), "-", "-"],
+                ["CPA", fmt_num(g(daily["today"], "회원가입당 단가 (Total)"), "원"), "-", "-"],
+                ["가입전환율", fmt_ratio_pct(g(daily["today"], "가입 전환율 (Total)")), "-", "-"],
             ],
         )
     )
 
-    children.append(h2("3. 매체별 효율"))
+    children.append(h2("3. 📡 매체별 효율"))
     if mediamix:
-        children.append(para("9월 매체별 예산 배분(계획). 매체별 실적은 원본 시트에 없어 계획 대비 비교는 별도 연동이 필요합니다."))
+        children.append(para(f"{target_date.month}월 매체별 예산 배분(계획). 매체별 실적은 원본 시트에 없어 계획 대비 비교는 별도 연동이 필요합니다."))
         children.append(
             table(
                 ["매체", "예산", "비중", "예상 CPI", "예상 CPA"],
                 [
                     [
                         r["매체"],
-                        f"{r['예산']:,}" if r["예산"] is not None else "-",
-                        f"{r['비중'] * 100:.1f}%" if r["비중"] is not None else "-",
-                        f"{r['CPI']:,}" if r["CPI"] is not None else "-",
-                        f"{r['CPA']:,}" if r["CPA"] is not None else "-",
+                        fmt_num(r["예산"], "원"),
+                        fmt_ratio_pct(r["비중"]),
+                        fmt_num(r["CPI"], "원"),
+                        fmt_num(r["CPA"], "원"),
                     ]
                     for r in mediamix
                 ],
@@ -662,26 +709,38 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
     else:
         children.append(para("이번 달 MediaMix 탭을 찾지 못했습니다 — 탭 이름 규칙이 바뀌었을 수 있습니다."))
 
-    children.append(h2("4. 전체 소재 효율"))
-    children.append(para(f"{target_date.isoformat()} 기준 운영 중인 소재 (D+14 집계 기준 수치)."))
+    children.append(h2(f"4. 🎨 전체 소재 효율 — {date_label}"))
+    children.append(para(f"{date_label} 기준 운영 중인 소재 (D+14 집계 기준 수치)."))
     if high:
+        children.append(para("🟢 고효율"))
         children.append(
             table(
                 ["소재", "운영기간", "USP", "CPA", "가입전환율"],
                 [
-                    [(c["name"], c.get("link")) if c.get("link") else c["name"], c["period"], c["usp"], c["cpa"], c["cvr"]]
+                    [
+                        (c["name"], c.get("link")) if c.get("link") else c["name"],
+                        c["period"],
+                        c["usp"],
+                        fmt_num(c["cpa"], "원"),
+                        fmt_ratio_pct(c["cvr"]),
+                    ]
                     for c in high
                 ],
                 link_col=0,
             )
         )
     if low:
-        children.append(para("저효율 (중단/교체 후보)"))
+        children.append(para("🔴 저효율 (중단/교체 후보)"))
         children.append(
             table(
                 ["소재", "운영기간", "집행 금액", "설치/가입"],
                 [
-                    [(c["name"], c.get("link")) if c.get("link") else c["name"], c["period"], c["spend"], f"{c['install'] or 0}/{c['signup'] or 0}"]
+                    [
+                        (c["name"], c.get("link")) if c.get("link") else c["name"],
+                        c["period"],
+                        fmt_num(c["spend"], "원"),
+                        f"{c['install'] or 0}/{c['signup'] or 0}",
+                    ]
                     for c in low
                 ],
                 link_col=0,
@@ -690,32 +749,40 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
     if not high and not low:
         children.append(para("해당 날짜에 활성 소재 데이터를 찾지 못했습니다."))
 
-    children.append(h2("5. 매체별 소재 효율"))
+    children.append(h2("5. 📱 매체별 소재 효율"))
+    rows = []
     if media_creatives:
-        children.append(
-            para(
-                "'신규 소재 성과' 탭의 매체 필터를 META/Tiktok/Moloco로 순회하며 읽었습니다 "
-                "(Google UAC·ASA·네이버BSA는 이 탭에 소재 단위 추적이 없어 필터 옵션에도 없습니다)."
-            )
-        )
-        children.append(
-            table(
-                ["매체", "소재별 효율"],
-                [[media, summarize_media_creatives(cs)] for media, cs in media_creatives.items()],
-            )
+        rows.extend([media, summarize_media_creatives(cs)] for media, cs in media_creatives.items())
+        note = (
+            "'신규 소재 성과' 탭의 매체 필터를 META/Tiktok/Moloco로 순회하며 읽었습니다. "
+            "UAC·네이버BSA는 이 탭에 소재 단위 추적이 없어 필터 옵션에도 없는데, "
+            "대신 3번 매체별 효율(MediaMix)의 매체 믹스 수치로 보충했습니다."
         )
     else:
-        children.append(para("매체별 소재 효율을 읽지 못했습니다 — 필터 셀 접근에 실패했을 수 있습니다."))
+        note = "매체별 소재 효율을 읽지 못했습니다 — 필터 셀 접근에 실패했을 수 있습니다."
 
-    children.append(h2("6. 개선점"))
+    for keyword in ("UAC", "BSA"):
+        m = find_media(mediamix, keyword)
+        if m:
+            summary = (
+                f"소재 단위 추적 없음 · 매체 믹스 기준 예산 {fmt_num(m['예산'], '원')} · "
+                f"예상 CPI {fmt_num(m['CPI'], '원')} · 예상 CPA {fmt_num(m['CPA'], '원')}"
+            )
+            rows.append([m["매체"], summary])
+
+    children.append(para(note))
+    if rows:
+        children.append(table(["매체", "소재별 효율"], rows))
+
+    children.append(h2("6. 💡 개선점"))
     improvements = []
     if low:
         names = ", ".join(c["name"] for c in low)
-        improvements.append(f"저효율 소재 정리 검토 대상: {names}")
+        improvements.append(f"🗑️ 저효율 소재 정리 검토 대상: {names}")
     if high:
         top = high[0]
-        improvements.append(f"고효율 패턴 확장 후보: {top['name']} (CPA {top['cpa']}원, USP: {top['usp']})")
-    improvements.append("매체별 실적 데이터가 없어 채널 간 예산 재배분 판단이 어렵습니다 — 매체 API 연동을 우선 검토하세요.")
+        improvements.append(f"🚀 고효율 패턴 확장 후보: {top['name']} (CPA {fmt_num(top['cpa'], '원')}, USP: {top['usp']})")
+    improvements.append("🔌 매체별 실적 데이터가 없어 채널 간 예산 재배분 판단이 어렵습니다 — 매체 API 연동을 우선 검토하세요.")
     for text in improvements:
         children.append(numbered(text))
 
