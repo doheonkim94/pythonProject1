@@ -18,7 +18,15 @@ v2는 본문까지 동일한 6단 구성으로 생성합니다.
   - 서비스 계정에 Google Drive API도 사용 설정 (Sheets API와 별개로 켜야 함)
 
 사용법:
-  python daily_report.py --date 2026-09-01
+  python daily_report.py --date 2026-09-01   # 특정 날짜 하나만 (백필/테스트용)
+  python daily_report.py                     # 자동 모드: 지금(KST) 기준으로 대행사
+                                              # 데이터가 이미 올라왔지만 아직 노션에
+                                              # 발행 안 된 날짜를 전부 찾아 발행한다.
+
+자동 모드가 쓰는 업데이트 규칙 (README 참고):
+  - 월~목 데이터: 그 다음날 오후 1시(KST)
+  - 금요일 데이터: 그 다음주 월요일 오후 1시(KST)
+  - 토/일 데이터: 그 다음 월요일 오후 1시(KST) — 금/토/일이 같은 시점에 함께 올라온다.
 """
 
 import argparse
@@ -43,6 +51,9 @@ CREATIVE_TAB = "신규 소재 성과"
 # 사람 화면에도 순간적으로 영향을 줄 수 있음).
 CREATIVE_MEDIA_FILTER_CELL = f"'{CREATIVE_TAB}'!Q5"
 CREATIVE_MEDIA_OPTIONS = ["META", "Tiktok", "Moloco"]
+
+KST = datetime.timezone(datetime.timedelta(hours=9))
+AUTO_LOOKBACK_DAYS = 14  # 자동 모드에서 "발행됐어야 하는데 빠졌는지" 되돌아볼 기간
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
@@ -93,6 +104,42 @@ def parse_number(cell):
 
 def row_date_label(d: datetime.date) -> str:
     return f"{d.month}/{d.day} ({WEEKDAY_KR[d.weekday()]})"
+
+
+# ── 자동 발행: 이 날짜의 데이터가 지금(KST) 이미 올라와 있는지 판단 ──────────
+def data_ready_at(d: datetime.date) -> datetime.datetime:
+    """대행사가 날짜 d의 데이터를 올리는 시점(KST)을 돌려준다.
+    월~목요일 데이터는 다음날 오후 1시, 금/토/일 데이터는 모두 그 다음 월요일
+    오후 1시에 한꺼번에 올라온다."""
+    weekday = d.weekday()  # 0=월 ... 6=일
+    if weekday <= 3:  # 월,화,수,목
+        delay_days = 1
+    elif weekday == 4:  # 금
+        delay_days = 3
+    elif weekday == 5:  # 토
+        delay_days = 2
+    else:  # 일
+        delay_days = 1
+    ready_date = d + datetime.timedelta(days=delay_days)
+    return datetime.datetime.combine(ready_date, datetime.time(13, 0), tzinfo=KST)
+
+
+def is_data_ready(d: datetime.date, as_of: datetime.datetime) -> bool:
+    return as_of >= data_ready_at(d)
+
+
+def pending_dates(as_of: datetime.datetime, published: set, lookback_days: int = AUTO_LOOKBACK_DAYS):
+    """as_of(KST) 시점에 데이터가 이미 준비됐지만 아직 published에 없는 날짜들을,
+    오래된 날짜부터 순서대로 돌려준다."""
+    today = as_of.date()
+    result = []
+    for i in range(lookback_days, 0, -1):
+        d = today - datetime.timedelta(days=i)
+        if d in published:
+            continue
+        if is_data_ready(d, as_of):
+            result.append(d)
+    return result
 
 
 def find_header_row(values, must_contain):
@@ -704,6 +751,38 @@ def build_properties(target_date, daily):
     }
 
 
+def fetch_published_dates():
+    """일간 리포트 DB에 이미 만들어진 페이지들의 '날짜' 제목을 모두 모은다.
+    자동 모드에서 이미 발행된 날짜를 다시 만들지 않기 위해 쓴다."""
+    headers = {
+        "Authorization": f"Bearer {os.environ['NOTION_TOKEN']}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    dates = set()
+    cursor = None
+    while True:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        resp = requests.post(
+            f"{NOTION_API}/databases/{DAILY_DB_ID}/query", headers=headers, json=payload, timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for page in data.get("results", []):
+            title = page.get("properties", {}).get("날짜", {}).get("title", [])
+            text = "".join(t.get("plain_text", "") for t in title)
+            try:
+                dates.add(datetime.date.fromisoformat(text))
+            except ValueError:
+                continue
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return dates
+
+
 def create_notion_page(properties, children):
     headers = {
         "Authorization": f"Bearer {os.environ['NOTION_TOKEN']}",
@@ -728,16 +807,7 @@ def notify_gchat(page_url, target_date):
     resp.raise_for_status()
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--date")
-    args = parser.parse_args()
-    target_date = datetime.date.fromisoformat(args.date) if args.date else datetime.date.today()
-
-    creds = google_creds()
-    sheets = sheets_client(creds)
-    drive = drive_client(creds)
-
+def generate_report(sheets, drive, target_date):
     daily = fetch_daily_rows(sheets, target_date)
     mtd = fetch_mtd_summary(sheets, target_date)
     mediamix = aggregate_mediamix(fetch_mediamix(sheets, target_date))
@@ -766,8 +836,40 @@ def main():
 
     page = create_notion_page(properties, children)
     page_url = page.get("url", "")
-    print(f"노션 페이지 생성 완료: {page_url}")
+    print(f"{target_date.isoformat()} 노션 페이지 생성 완료: {page_url}")
     notify_gchat(page_url, target_date)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", help="이 날짜 하나만 발행 (백필/테스트용). 생략하면 자동 모드로 동작.")
+    args = parser.parse_args()
+
+    creds = google_creds()
+    sheets = sheets_client(creds)
+    drive = drive_client(creds)
+
+    if args.date:
+        generate_report(sheets, drive, datetime.date.fromisoformat(args.date))
+        return
+
+    now = datetime.datetime.now(KST)
+    published = fetch_published_dates()
+    dates = pending_dates(now, published)
+    if not dates:
+        print(f"자동 모드: {now.isoformat()} 기준 새로 발행할 날짜가 없습니다.")
+        return
+
+    print(f"자동 모드: 발행 대상 {len(dates)}일 — {[d.isoformat() for d in dates]}")
+    failed = []
+    for d in dates:
+        try:
+            generate_report(sheets, drive, d)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[실패] {d.isoformat()}: {exc}", file=sys.stderr)
+            failed.append(d)
+    if failed:
+        raise RuntimeError(f"{len(failed)}일 발행 실패: {[d.isoformat() for d in failed]}")
 
 
 if __name__ == "__main__":
