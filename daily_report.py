@@ -62,6 +62,10 @@ NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 DAILY_DB_ID = "3e6fbc1a-b2c3-8102-8e86-c4fae95fe55b"  # 일간 리포트 데이터베이스 ID (새 페이지 위치)
 
+META_API = "https://graph.facebook.com/v21.0"
+META_AD_ACCOUNT_ID = "act_343984491884470"  # 파스타 광고 계정
+AGE_BUCKET_ORDER = ["13-17", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
+
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 
@@ -318,6 +322,37 @@ def fetch_mtd_series(service, target_date):
         )
     series.sort(key=lambda x: x["date"])
     return series
+
+
+def fetch_meta_signup_age(target_date):
+    """META 광고 계정에서 이번 달(1일~target_date) 회원가입(앱 SDK
+    complete_registration 이벤트) 건수를 연령대별로 집계한다. 다른 매체는
+    연령 데이터를 아예 안 줘서, 이건 META 전용 지표로만 취급해야 한다."""
+    token = os.environ["META_ACCESS_TOKEN"]
+    month_start = target_date.replace(day=1)
+    params = {
+        "access_token": token,
+        "level": "account",
+        "fields": "actions",
+        "breakdowns": "age,gender",
+        "action_breakdowns": "action_type",
+        "time_range": json.dumps({"since": month_start.isoformat(), "until": target_date.isoformat()}),
+        "limit": 100,
+    }
+    resp = requests.get(f"{META_API}/{META_AD_ACCOUNT_ID}/insights", params=params, timeout=30)
+    resp.raise_for_status()
+    rows = resp.json().get("data", [])
+
+    by_age = {age: 0 for age in AGE_BUCKET_ORDER}
+    for row in rows:
+        age = row.get("age")
+        if age not in by_age:
+            continue
+        for action in row.get("actions", []):
+            if action["action_type"] == "app_custom_event.fb_mobile_complete_registration":
+                by_age[age] += int(float(action["value"]))
+                break
+    return by_age
 
 
 # ── 2. MediaMix_YY.MM. (매체별 예산 배분) ───────────────────────────────
@@ -689,7 +724,7 @@ def find_media(mediamix, keyword):
     return None
 
 
-def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id=None):
+def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id=None, age_chart_id=None):
     def g(row, col):
         return parse_number(row.get(col))
 
@@ -720,6 +755,9 @@ def build_children(target_date, daily, mediamix, high, low, media_creatives, mtd
     )
     if mtd_chart_id:
         children.append(image_upload_block(mtd_chart_id, "이번 달 일별 앱설치 · 회원가입 추이"))
+    if age_chart_id:
+        children.append(para("👥 META 광고 전환(회원가입) 기준 연령대 분포 — 연령 데이터는 현재 META만 제공합니다."))
+        children.append(image_upload_block(age_chart_id, "META 가입자 연령대 분포 (이번 달 누적)"))
 
     children.append(h2(f"1. 💰 전체 예산 / 집행 금액 / 소진율 — {date_label}"))
     children.append(
@@ -993,6 +1031,22 @@ def generate_report(sheets, drive, target_date):
     except Exception as exc:  # noqa: BLE001
         print(f"[경고] MTD 차트 생성/업로드 실패 ({exc}) — 차트 없이 진행합니다.")
 
+    age_chart_id = None
+    try:
+        by_age = fetch_meta_signup_age(target_date)
+        if any(by_age.values()):
+            chart_path = f"/tmp/meta_age_chart_{target_date.isoformat()}.png"
+            charts.bar_chart(
+                list(by_age.keys()),
+                list(by_age.values()),
+                f"META 가입자 연령대 분포 (이번 달 누적, {target_date.year}-{target_date.month:02d})",
+                chart_path,
+                ylabel="회원가입 수",
+            )
+            age_chart_id = notion_upload_file(chart_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[경고] META 연령대 차트 생성/업로드 실패 ({exc}) — 차트 없이 진행합니다.")
+
     mediamix = aggregate_mediamix(fetch_mediamix(sheets, target_date))
     active = fetch_active_creatives(sheets, target_date)
     drive_ok = True
@@ -1019,7 +1073,7 @@ def generate_report(sheets, drive, target_date):
         media_creatives = {}
 
     properties = build_properties(target_date, daily)
-    children = build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id)
+    children = build_children(target_date, daily, mediamix, high, low, media_creatives, mtd, mtd_chart_id, age_chart_id)
 
     page = create_notion_page(properties, children)
     page_url = page.get("url", "")
