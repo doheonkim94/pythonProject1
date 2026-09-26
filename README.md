@@ -60,10 +60,17 @@ v1 스크립트는 노션 데이터베이스의 "속성(숫자 컬럼)"만 채�
 1. 이 저장소를 GitHub에 올린다
 2. https://claude.ai/code/routines 접속 > New routine
 3. Repository: 방금 만든 저장소
-4. Environment: 아래 세 값을 **API credentials**(환경변수 아님, 값이 노출되지 않는 자격증명 섹션)로 등록
-   - `GOOGLE_SERVICE_ACCOUNT_JSON` — 1번에서 받은 JSON 파일의 전체 내용을 그대로 붙여넣기
+4. Environment: 아래 값들을 클라우드 환경 설정의 **환경 변수**(API credentials 자격증명 섹션이
+   아님 — 그건 도메인별 HTTP 헤더 주입용이라 JSON/URL 같은 값을 담기에 안 맞음)에 `KEY=value`
+   형식으로 한 줄씩 등록
+   - `GOOGLE_SERVICE_ACCOUNT_JSON` — 1번에서 받은 JSON 파일의 전체 내용을 한 줄로(minify) 붙여넣기
    - `NOTION_TOKEN` — 2번 토큰
    - `GCHAT_WEBHOOK_URL` — 3번 URL
+   - `NAVER_CLIENT_ID` / `NAVER_CLIENT_SECRET` — 경쟁사 리포트(`competitor_report.py`)용 네이버 검색 API
+   - `META_ACCESS_TOKEN` — `ads_read` 권한 토큰. 일간 리포트의 META 가입자 연령대 차트에 사용
+     (없으면 그 차트만 건너뛰고 나머지는 정상 발행됨)
+   - `AIRBRIDGE_API_TOKEN` — Airbridge Settings > Tokens의 "API Token"(트래킹 링크용 토큰과는
+     다름). 일간 리포트의 매체별 실제 성과(Airbridge 기준) 표에 사용 (없으면 그 표만 빠짐)
 5. Prompt 예시:
    > `daily_report.py`를 인자 없이 실행해서, 아직 발행되지 않았지만 데이터가 이미 올라온
    > 날짜의 파스타 일간 리포트를 전부 만들어줘. 에러가 나면 원인과 함께 실패로 보고해.
@@ -78,6 +85,8 @@ pip install -r requirements.txt
 export GOOGLE_SERVICE_ACCOUNT_JSON="$(cat /path/to/service-account.json)"
 export NOTION_TOKEN="ntn_..."
 export GCHAT_WEBHOOK_URL="https://chat.googleapis.com/..."
+export META_ACCESS_TOKEN="..."       # 선택 — 없으면 연령대 차트만 생략
+export AIRBRIDGE_API_TOKEN="..."     # 선택 — 없으면 매체별 실제 성과 표만 생략
 python daily_report.py --date 2026-09-20
 ```
 
