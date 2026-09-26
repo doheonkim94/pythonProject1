@@ -416,7 +416,16 @@ def summarize_media_creatives(creatives):
 def drive_link(drive, creative_name):
     escaped = creative_name.replace("'", "\\'")
     q = f"name contains '{escaped}' and trashed = false"
-    resp = drive.files().list(q=q, fields="files(id, webViewLink)", pageSize=1).execute()
+    resp = drive.files().list(
+        q=q,
+        fields="files(id, webViewLink)",
+        pageSize=1,
+        # 소재 원본이 '내 드라이브'가 아니라 공유 드라이브(Shared Drive)에 있어서,
+        # 이 옵션이 없으면 서비스 계정에 아무 파일도 안 보인다.
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        corpora="allDrives",
+    ).execute()
     files = resp.get("files", [])
     if not files:
         return None
